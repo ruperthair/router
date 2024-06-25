@@ -40,6 +40,7 @@ use crate::error::FederationError;
 use crate::link::federation_spec_definition::FEDERATION_EXTERNAL_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::federation_spec_definition::FEDERATION_INTERFACEOBJECT_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::federation_spec_definition::FEDERATION_KEY_DIRECTIVE_NAME_IN_SPEC;
+use crate::link::federation_spec_definition::FEDERATION_OVERRIDE_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::federation_spec_definition::FEDERATION_PROVIDES_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::federation_spec_definition::FEDERATION_REQUIRES_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::spec::Identity;
@@ -433,6 +434,10 @@ impl Merger {
             })
             .unwrap_or(FEDERATION_INTERFACEOBJECT_DIRECTIVE_NAME_IN_SPEC);
 
+        let override_directive_name = federation_identity
+            .map(|link| link.directive_name_in_schema(&FEDERATION_OVERRIDE_DIRECTIVE_NAME_IN_SPEC))
+            .unwrap_or(FEDERATION_OVERRIDE_DIRECTIVE_NAME_IN_SPEC);
+
         let is_interface_object = object.directives.has(&interface_object_directive_name);
         let existing_type = types
             .entry(object_name.clone())
@@ -510,6 +515,17 @@ impl Merger {
                     },
                 );
 
+                let overrides_directive_option = Option::and_then(
+                    field.directives.get_all(&override_directive_name).next(),
+                    |p| {
+                        let overrides_from =
+                            directive_string_arg_value(p, &name!("from")).map(|v| v.as_str());
+                        let ovevrrides_label =
+                            directive_string_arg_value(p, &name!("label")).map(|v| v.as_str());
+                        overrides_from.map(|from| (from, ovevrrides_label))
+                    },
+                );
+
                 let external_field = field
                     .directives
                     .get_all(&external_directive_name)
@@ -521,6 +537,7 @@ impl Merger {
                     requires_directive_option,
                     provides_directive_option,
                     external_field,
+                    overrides_directive_option,
                 );
 
                 supergraph_field
@@ -1089,6 +1106,13 @@ fn join_field_directive_definition() -> DirectiveDefinition {
                 default_value: None,
             }),
             Node::new(InputValueDefinition {
+                name: name!("overrideLabel"),
+                description: None,
+                directives: Default::default(),
+                ty: ty!(String).into(),
+                default_value: None,
+            }),
+            Node::new(InputValueDefinition {
                 name: name!("usedOverridden"),
                 description: None,
                 directives: Default::default(),
@@ -1109,6 +1133,7 @@ fn join_field_applied_directive(
     requires: Option<&str>,
     provides: Option<&str>,
     external: bool,
+    overrides: Option<(&str, Option<&str>)>, // from, label
 ) -> Directive {
     let mut join_field_directive = Directive {
         name: name!("join__field"),
@@ -1134,6 +1159,18 @@ fn join_field_applied_directive(
             name: name!("external"),
             value: Node::new(Value::Boolean(external)),
         }));
+    }
+    if let Some((from, label)) = overrides {
+        join_field_directive.arguments.push(Node::new(Argument {
+            name: name!("override"),
+            value: Node::new(Value::String(NodeStr::new(from))),
+        }));
+        if let Some(label) = label {
+            join_field_directive.arguments.push(Node::new(Argument {
+                name: name!("overrideLabel"),
+                value: Node::new(Value::String(NodeStr::new(label))),
+            }));
+        }
     }
     join_field_directive
 }
