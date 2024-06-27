@@ -183,6 +183,7 @@ dependencies = [
  "either",
  "enum_dispatch",
  "hex",
+ "http 0.2.11",
  "indexmap 2.2.3",
  "insta",
  "itertools 0.13.0",
