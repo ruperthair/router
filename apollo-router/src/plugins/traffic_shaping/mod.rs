@@ -325,27 +325,11 @@ impl TrafficShaping {
             .boxed()
     }
 
-    pub(crate) fn subgraph_service_internal<S>(
+    pub(crate) fn subgraph_service_internal(
         &self,
         name: &str,
-        service: S,
-    ) -> impl Service<
-        subgraph::Request,
-        Response = subgraph::Response,
-        Error = BoxError,
-        Future = TrafficShapingSubgraphFuture<S>,
-    > + Clone
-           + Send
-           + Sync
-           + 'static
-    where
-        S: Service<subgraph::Request, Response = subgraph::Response, Error = BoxError>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        <S as Service<subgraph::Request>>::Future: std::marker::Send,
-    {
+        service: subgraph::BoxService,
+    ) -> subgraph::BoxService {
         // Either we have the subgraph config and we merge it with the all config, or we just have the all config or we have nothing.
         let all_config = self.config.all.as_ref();
         let subgraph_config = self.config.subgraphs.get(name);
@@ -379,8 +363,7 @@ impl TrafficShaping {
             });
 
             let timeout = config.shaping.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            Either::A(ServiceBuilder::new()
-
+            ServiceBuilder::new()
                 .option_layer(config.shaping.deduplicate_query.unwrap_or_default().then(
                   QueryDeduplicationLayer::default
                 ))
@@ -402,7 +385,7 @@ impl TrafficShaping {
                         },
                     )
                     .option_layer(retry)
-                    .option_layer(rate_limit)
+                    // .option_layer(rate_limit)
                 .service(service)
                 .map_request(move |mut req: SubgraphRequest| {
                     if let Some(compression) = config.shaping.compression {
@@ -411,9 +394,9 @@ impl TrafficShaping {
                     }
 
                     req
-                }))
+                }).boxed()
         } else {
-            Either::B(service)
+            service
         }
     }
 
