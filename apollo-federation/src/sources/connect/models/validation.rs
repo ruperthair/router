@@ -50,6 +50,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::iter::once;
 use std::ops::Range;
 
 use apollo_compiler::ast::FieldDefinition;
@@ -67,6 +68,7 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::link::Link;
+use crate::sources::connect::json_selection::JSONSelectionVisitor;
 use crate::sources::connect::spec::schema::CONNECT_ENTITY_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_DELETE_METHOD_NAME;
 use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_GET_METHOD_NAME;
@@ -74,12 +76,14 @@ use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_PATCH_METHOD_NAME;
 use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_POST_METHOD_NAME;
 use crate::sources::connect::spec::schema::CONNECT_HTTP_ARGUMENT_PUT_METHOD_NAME;
+use crate::sources::connect::spec::schema::CONNECT_SELECTION_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::CONNECT_SOURCE_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::SOURCE_BASE_URL_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::SOURCE_DIRECTIVE_NAME_IN_SPEC;
 use crate::sources::connect::spec::schema::SOURCE_HTTP_ARGUMENT_NAME;
 use crate::sources::connect::spec::schema::SOURCE_NAME_ARGUMENT_NAME;
 use crate::sources::connect::ConnectSpecDefinition;
+use crate::sources::connect::JSONSelection;
 
 /// Validate the connectors-related directives `@source` and `@connect`.
 ///
@@ -257,7 +261,7 @@ fn validate_object_fields(
                 field,
                 object_category,
                 source_names,
-                &object.name,
+                object,
                 connect_directive_name,
                 source_directive_name,
                 schema,
@@ -270,7 +274,7 @@ fn validate_field(
     field: &Component<FieldDefinition>,
     category: ObjectCategory,
     source_names: &[SourceName],
-    object_name: &Name,
+    object: &Node<ObjectType>,
     connect_directive_name: &Name,
     source_directive_name: &Name,
     schema: &Schema,
@@ -288,15 +292,16 @@ fn validate_field(
                 message: format!(
                     "The field `{object_name}.{field}` has no `@{connect_directive_name}` directive.",
                     field = field.name,
+                    object_name = object.name,
                 ),
                 locations: Location::from_node(field.location(), source_map)
                     .into_iter()
                     .collect(),
             });
         }
-        // TODO: return errors when a field is not resolvable by some combination of `@connect`
         return errors;
     };
+    errors.extend(validate_selection(field, connect_directive, object, schema));
     let Some((http_arg, http_arg_location)) = connect_directive
         .argument_by_name(&CONNECT_HTTP_ARGUMENT_NAME)
         .and_then(|arg| Some((arg.as_object()?, arg.location())))
@@ -306,7 +311,7 @@ fn validate_field(
             message: format!(
                 "{coordinate} must have a `{CONNECT_HTTP_ARGUMENT_NAME}` argument.",
                 coordinate =
-                    connect_directive_coordinate(connect_directive_name, object_name, &field.name),
+                    connect_directive_coordinate(connect_directive_name, object, &field.name),
             ),
             locations: Location::from_node(connect_directive.location(), source_map)
                 .into_iter()
@@ -332,11 +337,8 @@ fn validate_field(
             code: Code::MultipleHttpMethods,
             message: format!(
                 "{coordinate} cannot specify more than one HTTP method.",
-                coordinate = connect_directive_http_coordinate(
-                    connect_directive_name,
-                    object_name,
-                    &field.name
-                ),
+                coordinate =
+                    connect_directive_http_coordinate(connect_directive_name, object, &field.name),
             ),
             locations: http_methods
                 .iter()
@@ -348,11 +350,8 @@ fn validate_field(
             code: Code::MissingHttpMethod,
             message: format!(
                 "{coordinate} must specify an HTTP method.",
-                coordinate = connect_directive_http_coordinate(
-                    connect_directive_name,
-                    object_name,
-                    &field.name
-                ),
+                coordinate =
+                    connect_directive_http_coordinate(connect_directive_name, object, &field.name),
             ),
             locations: Location::from_node(http_arg_location, source_map)
                 .into_iter()
@@ -365,7 +364,7 @@ fn validate_field(
             connect_directive_url_coordinate(
                 connect_directive_name,
                 http_method,
-                object_name,
+                object,
                 &field.name,
             ),
         )
@@ -386,7 +385,7 @@ fn validate_field(
                     code: Code::EntityNotOnRootQuery,
                     message: format!(
                         "{coordinate} is invalid. Entity resolvers can only be declared on root `Query` fields.", 
-                        coordinate = connect_directive_entity_argument_coordinate(connect_directive_name, entity_arg_value.as_ref(), object_name, &field.name)
+                        coordinate = connect_directive_entity_argument_coordinate(connect_directive_name, entity_arg_value.as_ref(), object, &field.name)
                     ),
                     locations: Location::from_node(entity_arg.location(), source_map)
                         .into_iter()
@@ -402,7 +401,7 @@ fn validate_field(
                         coordinate = connect_directive_entity_argument_coordinate(
                             connect_directive_name,
                             entity_arg_value.as_ref(),
-                            object_name,
+                            object,
                             &field.name
                         )
                     ),
@@ -424,7 +423,7 @@ fn validate_field(
             let qualified_directive = connect_directive_name_coordinate(
                 connect_directive_name,
                 &source_name.value,
-                object_name,
+                object,
                 &field.name,
             );
             if let Some(first_source_name) = source_names.first() {
@@ -484,6 +483,182 @@ fn validate_field(
     errors
 }
 
+fn validate_selection(
+    field: &Component<FieldDefinition>,
+    connect_directive: &Node<Directive>,
+    object: &Node<ObjectType>,
+    schema: &Schema,
+) -> Vec<Message> {
+    let (selection_value, json_selection) =
+        match get_json_selection(connect_directive, object, &field.name, &schema.sources) {
+            Ok(selection) => selection,
+            Err(err) => return vec![err],
+        };
+
+    let Some(return_type) = schema.get_object(field.ty.inner_named_type()) else {
+        // TODO: handle scalars
+        return vec![];
+    };
+
+    SelectionValidator {
+        root_type: return_type,
+        schema,
+        path: vec![],
+        selection_coordinate: connect_directive_selection_coordinate(
+            &connect_directive.name,
+            object,
+            &field.name,
+        ),
+        selection_location: Location::from_node(selection_value.location(), &schema.sources),
+        messages: vec![],
+    }
+    .walk(&json_selection)
+    .err()
+    .unwrap_or_default()
+}
+
+fn get_json_selection<'a>(
+    connect_directive: &'a Node<Directive>,
+    object: &Node<ObjectType>,
+    field_name: &Name,
+    source_map: &SourceMap,
+) -> Result<(&'a Node<Value>, JSONSelection), Message> {
+    let selection_arg = connect_directive
+        .arguments
+        .iter()
+        .find(|arg| arg.name == CONNECT_SELECTION_ARGUMENT_NAME)
+        .ok_or_else(|| Message {
+            code: Code::GraphQLError,
+            message: format!(
+                "{coordinate} is required.",
+                coordinate = connect_directive_selection_coordinate(
+                    &connect_directive.name,
+                    object,
+                    field_name
+                ),
+            ),
+            locations: Location::from_node(connect_directive.location(), source_map)
+                .into_iter()
+                .collect(),
+        })?;
+    let selection_str = require_value_is_str(
+        &selection_arg.value,
+        &connect_directive_selection_coordinate(&connect_directive.name, object, field_name),
+        source_map,
+    )?;
+
+    let (_rest, selection) = JSONSelection::parse(selection_str).map_err(|err| Message {
+        code: Code::InvalidJsonSelection,
+        message: format!(
+            "{coordinate} is not a valid JSONSelection: {err}",
+            coordinate =
+                connect_directive_selection_coordinate(&connect_directive.name, object, field_name),
+        ),
+        locations: Location::from_node(selection_arg.value.location(), source_map)
+            .into_iter()
+            .collect(),
+    })?;
+    Ok((&selection_arg.value, selection))
+}
+
+struct SelectionValidator<'schema, 'selection> {
+    schema: &'schema Schema,
+    root_type: &'schema Node<ObjectType>,
+    path: Vec<(&'selection str, Option<&'schema Node<ObjectType>>)>,
+    messages: Vec<Message>,
+    selection_location: Option<Range<Location>>,
+    selection_coordinate: String,
+}
+
+impl<'schema, 'selection> JSONSelectionVisitor<'selection>
+    for SelectionValidator<'schema, 'selection>
+{
+    type Error = Vec<Message>;
+
+    fn visit(&mut self, _name: &str) -> Result<(), Self::Error> {
+        // TODO: Validate that the field exists
+        Ok(())
+    }
+
+    fn enter_group(&mut self, field_name: &'selection str) -> Result<(), Self::Error> {
+        let current_object = self
+            .path
+            .last()
+            .map(|(_, object)| *object)
+            .unwrap_or(Some(self.root_type));
+        self.path.push((field_name, None));
+        let Some(current_object) = current_object else {
+            // There was a problem with a previous part of the selection, we don't have enough
+            // info to continue this group
+            // TODO: TEST THIS
+            return Ok(());
+        };
+        let Some(field) = current_object.fields.get(field_name) else {
+            self.messages.push(Message {
+                code: Code::SelectedFieldNotFound,
+                message: format!(
+                    "{coordinate} contains field `{field_name}`, which does not exist on `{current_object_name}`.",
+                    coordinate = &self.selection_coordinate,
+                    current_object_name = current_object.name
+                ),
+                locations: self.selection_location.iter().cloned().collect(),
+            });
+            return Ok(()); // Keep looking for more errors in the selection
+        };
+
+        let Some(new_object) = self.schema.get_object(field.ty.inner_named_type()) else {
+            self.messages.push(Message {
+                code: Code::GroupSelectionIsNotObject,
+                message: format!(
+                    "{coordinate} selects a group `{field_name}`, but `{current_object_name}.{field_name}` is not an object.",
+                    coordinate = &self.selection_coordinate,
+                    current_object_name = current_object.name,
+                ),
+                locations: self.selection_location.iter().cloned().chain(Location::from_node(field.location(), &self.schema.sources)).collect(),
+            });
+            return Ok(()); // Keep looking for more errors in the selection
+        };
+
+        for object in self
+            .path
+            .iter()
+            .filter_map(|(_, object)| *object)
+            .chain(once(self.root_type))
+        {
+            // TODO: Test non-root circular reference
+            if object == new_object {
+                self.messages.push(Message {
+                    code: Code::CircularReference,
+                    message: format!(
+                        "{coordinate} path `{selection_path}` contains a circular reference to `{new_object_name}`.",
+                        coordinate = &self.selection_coordinate,
+                        selection_path = self.path.iter().map(|(path, _)| path).join("."),
+                        new_object_name = new_object.name,
+                    ),
+                    locations: self.selection_location.iter().cloned().collect(), // TODO: include the offending field in locations
+                });
+                return Ok(());
+            }
+        }
+        self.path.pop(); // Remove the `None` value we pushed on enter
+        self.path.push((field_name, Some(new_object)));
+        Ok(())
+    }
+
+    fn exit_group(&mut self) -> Result<(), Self::Error> {
+        self.path.pop();
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        if self.messages.is_empty() {
+            Ok(())
+        } else {
+            Err(self.messages)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObjectCategory {
     Query,
@@ -530,45 +705,59 @@ fn require_value_is_str<'a>(
 
 fn connect_directive_coordinate(
     connect_directive_name: &Name,
-    object: &Name,
+    object: &Node<ObjectType>,
     field: &Name,
 ) -> String {
-    format!("`@{connect_directive_name}` on `{object}.{field}`")
+    format!(
+        "`@{connect_directive_name}` on `{object_name}.{field}`",
+        object_name = object.name
+    )
 }
 
 fn connect_directive_name_coordinate(
     connect_directive_name: &Name,
     source: &Node<Value>,
-    object: &Name,
+    object: &Node<ObjectType>,
     field: &Name,
 ) -> String {
-    format!("`@{connect_directive_name}({CONNECT_SOURCE_ARGUMENT_NAME}: {source})` on `{object}.{field}`")
+    format!("`@{connect_directive_name}({CONNECT_SOURCE_ARGUMENT_NAME}: {source})` on `{object_name}.{field}`", object_name = object.name)
 }
 
 fn connect_directive_entity_argument_coordinate(
     connect_directive_entity_argument: &Name,
     value: &Value,
-    object: &Name,
+    object: &Node<ObjectType>,
     field: &Name,
 ) -> String {
-    format!("`@{connect_directive_entity_argument}({CONNECT_ENTITY_ARGUMENT_NAME}: {value})` on `{object}.{field}`")
+    format!("`@{connect_directive_entity_argument}({CONNECT_ENTITY_ARGUMENT_NAME}: {value})` on `{object_name}.{field}`", object_name = object.name)
 }
 
 fn connect_directive_http_coordinate(
     connect_directive_name: &Name,
-    object: &Name,
+    object: &Node<ObjectType>,
     field: &Name,
 ) -> String {
-    format!("`@{connect_directive_name}({CONNECT_HTTP_ARGUMENT_NAME}:)` on `{object}.{field}`")
+    format!(
+        "`@{connect_directive_name}({CONNECT_HTTP_ARGUMENT_NAME}:)` on `{object_name}.{field}`",
+        object_name = object.name
+    )
 }
 
 fn connect_directive_url_coordinate(
     connect_directive_name: &Name,
     http_method: &Name,
-    object: &Name,
+    object: &Node<ObjectType>,
     field: &Name,
 ) -> String {
-    format!("`{http_method}` in `@{connect_directive_name}({CONNECT_HTTP_ARGUMENT_NAME}:)` on `{object}.{field}`")
+    format!("`{http_method}` in `@{connect_directive_name}({CONNECT_HTTP_ARGUMENT_NAME}:)` on `{object_name}.{field}`", object_name = object.name)
+}
+
+fn connect_directive_selection_coordinate(
+    connect_directive_name: &Name,
+    object: &Node<ObjectType>,
+    field: &Name,
+) -> String {
+    format!("`@{connect_directive_name}({CONNECT_SELECTION_ARGUMENT_NAME}:)` on `{object_name}.{field}`", object_name = object.name)
 }
 
 fn source_name_argument_coordinate(source_directive_name: &DirectiveName) -> String {
@@ -788,6 +977,13 @@ pub enum Code {
     EntityNotOnRootQuery,
     /// The `entity` argument should only be used with non-list, object types
     EntityTypeInvalid,
+    /// A syntax error in `selection`
+    InvalidJsonSelection,
+    /// A cycle was detected within a `selection`
+    CircularReference,
+    InternalError,
+    SelectedFieldNotFound,
+    GroupSelectionIsNotObject,
 }
 
 impl Code {

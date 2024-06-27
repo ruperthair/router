@@ -70,7 +70,9 @@ impl<'a> ToSchemaVisitor<'a> {
     }
 }
 
-impl JSONSelectionVisitor for ToSchemaVisitor<'_> {
+impl JSONSelectionVisitor<'_> for ToSchemaVisitor<'_> {
+    type Error = FederationError;
+
     fn visit(&mut self, name: &str) -> Result<(), FederationError> {
         let (definition, type_) = self.type_stack.last_mut().unwrap();
 

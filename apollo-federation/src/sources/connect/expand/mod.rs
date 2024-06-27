@@ -199,6 +199,7 @@ mod helpers {
     use crate::schema::ObjectFieldDefinitionPosition;
     use crate::schema::ObjectOrInterfaceFieldDefinitionPosition;
     use crate::schema::ValidFederationSchema;
+    use crate::sources::connect::json_selection::JSONSelectionVisitor;
     use crate::sources::connect::ConnectSpecDefinition;
     use crate::sources::connect::Connector;
     use crate::ValidFederationSubgraph;
@@ -300,7 +301,7 @@ mod helpers {
                     &directive_deny_list,
                 );
 
-                connector.selection.visit(visitor)?;
+                visitor.walk(&connector.selection)?;
             }
 
             let parent = object_field.parent();
