@@ -17,8 +17,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::TryFutureExt;
 use http::header::CONTENT_ENCODING;
 use http::HeaderValue;
+use http::StatusCode;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::retry::Retry;
@@ -34,8 +36,10 @@ use self::rate::RateLimitLayer;
 pub(crate) use self::rate::RateLimited;
 pub(crate) use self::retry::RetryPolicy;
 pub(crate) use self::timeout::Elapsed;
-use self::timeout::TimeoutLayer;
+use self::timeout::Timeout;
 use crate::error::ConfigurationError;
+use crate::graphql;
+use crate::layers::ServiceBuilderExt;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
 use crate::register_plugin;
@@ -288,38 +292,37 @@ impl TrafficShaping {
         merged_subgraph_config.or_else(|| all_config.cloned())
     }
 
-    pub(crate) fn supergraph_service_internal<S>(
+    pub(crate) fn supergraph_service_internal(
         &self,
-        service: S,
-    ) -> impl Service<
-        supergraph::Request,
-        Response = supergraph::Response,
-        Error = BoxError,
-        Future = timeout::future::ResponseFuture<
-            Oneshot<tower::util::Either<rate::service::RateLimit<S>, S>, supergraph::Request>,
-        >,
-    > + Clone
-           + Send
-           + Sync
-           + 'static
-    where
-        S: Service<supergraph::Request, Response = supergraph::Response, Error = BoxError>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        <S as Service<supergraph::Request>>::Future: std::marker::Send,
-    {
+        service: supergraph::BoxService,
+    ) -> supergraph::BoxService {
+        let timeout = self
+            .config
+            .router
+            .as_ref()
+            .and_then(|r| r.timeout)
+            .unwrap_or(DEFAULT_TIMEOUT);
         ServiceBuilder::new()
-            .layer(TimeoutLayer::new(
-                self.config
-                    .router
-                    .as_ref()
-                    .and_then(|r| r.timeout)
-                    .unwrap_or(DEFAULT_TIMEOUT),
-            ))
+            .map_future_with_request_data(
+                |req: &supergraph::Request| req.context.clone(),
+                move |ctx, response| {
+                    tokio::time::timeout(timeout, response).unwrap_or_else(|_| {
+                        supergraph::Response::error_builder()
+                            .status_code(StatusCode::GATEWAY_TIMEOUT)
+                            .error(
+                                graphql::Error::builder()
+                                    .message(String::from("Request timed out"))
+                                    .extension_code("REQUEST_TIMED_OUT")
+                                    .build(),
+                            )
+                            .context(ctx)
+                            .build()
+                    })
+                },
+            )
             .option_layer(self.rate_limit_router.clone())
             .service(service)
+            .boxed()
     }
 
     pub(crate) fn subgraph_service_internal<S>(
@@ -375,16 +378,29 @@ impl TrafficShaping {
                 tower::retry::RetryLayer::new(retry_policy)
             });
 
+            let timeout = config.shaping.timeout.unwrap_or(DEFAULT_TIMEOUT);
             Either::A(ServiceBuilder::new()
 
                 .option_layer(config.shaping.deduplicate_query.unwrap_or_default().then(
                   QueryDeduplicationLayer::default
                 ))
-                    .layer(TimeoutLayer::new(
-                        config.shaping
-                        .timeout
-                        .unwrap_or(DEFAULT_TIMEOUT),
-                    ))
+                    .map_future_with_request_data(
+                        |req: &supergraph::Request| req.context.clone(),
+                        move |ctx, response| {
+                            tokio::time::timeout(timeout, response).unwrap_or_else(|_| {
+                                supergraph::Response::error_builder()
+                                    .status_code(StatusCode::GATEWAY_TIMEOUT)
+                                    .error(
+                                        graphql::Error::builder()
+                                            .message(String::from("Request timed out"))
+                                            .extension_code("REQUEST_TIMED_OUT")
+                                            .build(),
+                                    )
+                                    .context(ctx)
+                                    .build()
+                            })
+                        },
+                    )
                     .option_layer(retry)
                     .option_layer(rate_limit)
                 .service(service)
@@ -816,7 +832,7 @@ mod test {
             .as_any()
             .downcast_ref::<TrafficShaping>()
             .unwrap()
-            .supergraph_service_internal(mock_service.clone())
+            .supergraph_service_internal(mock_service.clone().boxed())
             .oneshot(SupergraphRequest::fake_builder().build().unwrap())
             .await
             .unwrap()
@@ -828,7 +844,7 @@ mod test {
             .as_any()
             .downcast_ref::<TrafficShaping>()
             .unwrap()
-            .supergraph_service_internal(mock_service.clone())
+            .supergraph_service_internal(mock_service.clone().boxed())
             .oneshot(SupergraphRequest::fake_builder().build().unwrap())
             .await
             .is_err());
@@ -837,7 +853,7 @@ mod test {
             .as_any()
             .downcast_ref::<TrafficShaping>()
             .unwrap()
-            .supergraph_service_internal(mock_service.clone())
+            .supergraph_service_internal(mock_service.clone().boxed())
             .oneshot(SupergraphRequest::fake_builder().build().unwrap())
             .await
             .unwrap()

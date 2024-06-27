@@ -5,42 +5,29 @@
 use std::ops::ControlFlow;
 
 use apollo_compiler::ast::OperationType;
-use futures::future::BoxFuture;
 use http::header::HeaderName;
 use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
-use tower::BoxError;
 use tower::Layer;
-use tower::Service;
 use tower::ServiceBuilder;
+use tower::ServiceExt;
 
 use super::query_analysis::ParsedDocument;
 use crate::graphql::Error;
 use crate::json_ext::Object;
-use crate::layers::async_checkpoint::OneShotAsyncCheckpointService;
 use crate::layers::ServiceBuilderExt;
+use crate::services::supergraph;
 use crate::services::SupergraphRequest;
 use crate::services::SupergraphResponse;
 
 #[derive(Default)]
 pub(crate) struct AllowOnlyHttpPostMutationsLayer {}
 
-impl<S> Layer<S> for AllowOnlyHttpPostMutationsLayer
-where
-    S: Service<SupergraphRequest, Response = SupergraphResponse, Error = BoxError>
-        + Clone
-        + Send
-        + 'static,
-    <S as Service<SupergraphRequest>>::Future: Send + 'static,
-{
-    type Service = OneShotAsyncCheckpointService<
-        S,
-        BoxFuture<'static, Result<ControlFlow<SupergraphResponse, SupergraphRequest>, BoxError>>,
-        SupergraphRequest,
-    >;
+impl Layer<supergraph::BoxService> for AllowOnlyHttpPostMutationsLayer {
+    type Service = supergraph::BoxService;
 
-    fn layer(&self, service: S) -> Self::Service {
+    fn layer(&self, service: supergraph::BoxService) -> Self::Service {
         ServiceBuilder::new()
             .oneshot_checkpoint_async(|req: SupergraphRequest| {
                 Box::pin(async {
@@ -114,12 +101,9 @@ where
                         }
                     }
                 })
-                    as BoxFuture<
-                        'static,
-                        Result<ControlFlow<SupergraphResponse, SupergraphRequest>, BoxError>,
-                    >
             })
             .service(service)
+            .boxed()
     }
 }
 

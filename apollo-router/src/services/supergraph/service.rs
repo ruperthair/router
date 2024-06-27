@@ -878,10 +878,9 @@ impl SupergraphCreator {
             .and_then(|plugin| plugin.1.as_any().downcast_ref::<TrafficShaping>())
             .expect("traffic shaping should always be part of the plugin list");
 
-        let supergraph_service = AllowOnlyHttpPostMutationsLayer::default()
-            .layer(shaping.supergraph_service_internal(supergraph_service));
-
         ServiceBuilder::new()
+            .layer(AllowOnlyHttpPostMutationsLayer::default())
+            .layer_fn(|service| shaping.supergraph_service_internal(service))
             .layer(content_negotiation::SupergraphLayer::default())
             .service(
                 self.plugins
